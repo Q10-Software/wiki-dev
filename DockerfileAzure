@@ -1,0 +1,24 @@
+# Extiende la imagen oficial de Outline con un patch mínimo
+# para que funcione detrás de Azure App Service (X-Forwarded-For con puerto).
+#
+# Issue upstream: https://github.com/outline/outline/issues/6083
+
+ARG OUTLINE_VERSION=latest
+FROM docker.getoutline.com/outlinewiki/outline:${OUTLINE_VERSION}
+
+USER root
+
+# Patch: Outline recibe "IP:PUERTO" en ctx.ip porque Azure App Service
+# inyecta el puerto TCP en X-Forwarded-For. Strip del puerto antes de
+# persistirlo en lastActiveIp / lastSignedInIp.
+RUN set -eux; \
+    cd /opt/outline/build/server; \
+    # Reemplaza todas las referencias a ctx.ip en los archivos relevantes
+    for f in utils/authentication.js middlewares/passport.js commands/userProvisioner.js commands/accountProvisioner.js; do \
+      if [ -f "$f" ]; then \
+        sed -i 's/ctx\.ip/(ctx.ip ? ctx.ip.replace(\/:[0-9]\+$\/, "") : ctx.ip)/g' "$f"; \
+        echo "Patched: $f"; \
+      fi; \
+    done
+
+USER nodejs
