@@ -3,23 +3,58 @@ FROM docker.getoutline.com/outlinewiki/outline:${OUTLINE_VERSION}
 
 USER root
 
-# Patch: Outline recibe "IP:PUERTO" en ctx.request.ip / ctx.ip porque Azure
-# App Service inyecta el puerto TCP en X-Forwarded-For. Strip del puerto
-# antes de persistirlo en lastActiveIp / lastSignedInIp.
+# Patch: Outline recibe "IP:PUERTO" en headers porque Azure App Service
+# inyecta el puerto TCP en X-Forwarded-For. Strip del puerto en todos los
+# call sites donde se persiste el IP (User, Event, context, provisioner).
 #
 # Issue upstream: https://github.com/outline/outline/issues/6083
 
 RUN set -eux; \
     cd /opt/outline/build/server; \
-    # Patch User.js (donde está el flujo principal de signIn → updateSignedIn)
+    \
+    # ---- User.js: lastActiveIp / lastSignedInIp ----
     sed -i 's|this\.lastActiveIp = ctx\.request\.ip|this.lastActiveIp = (ctx.request.ip \&\& ctx.request.ip.replace(/:[0-9]\+$/, ""))|g' models/User.js; \
     sed -i 's|this\.lastSignedInIp = ctx\.request\.ip|this.lastSignedInIp = (ctx.request.ip \&\& ctx.request.ip.replace(/:[0-9]\+$/, ""))|g' models/User.js; \
     sed -i 's|_this\.lastActiveIp = ip|_this.lastActiveIp = (ip \&\& typeof ip === "string" ? ip.replace(/:[0-9]\+$/, "") : ip)|g' models/User.js; \
-    # Patch userProvisioner.js (ya parchado antes pero por si acaso)
+    \
+    # ---- userProvisioner.js: lastActiveIp ----
     sed -i 's|ctx\.ip|(ctx.ip ? ctx.ip.replace(/:[0-9]\+$/, "") : ctx.ip)|g' commands/userProvisioner.js 2>/dev/null || true; \
-    # Verificación
-    echo "=== Verificando patches en User.js ==="; \
-    grep -n "lastActiveIp\|lastSignedInIp" models/User.js | head -20; \
+    \
+    # ---- context.js: arma el ctx con la IP ----
+    # Patrón: ip: ip ?? user?.lastActiveIp  →  envolvemos la expresión
+    sed -i 's|ip: ip ?? user?\.lastActiveIp|ip: ((ip ?? user?.lastActiveIp) \&\& typeof (ip ?? user?.lastActiveIp) === "string") ? (ip ?? user?.lastActiveIp).replace(/:[0-9]\+$/, "") : (ip ?? user?.lastActiveIp)|g' context.js; \
+    \
+    # ---- Event.js: cualquier asignación a .ip = ctx... ----
+    # Buscamos patrones donde el modelo Event reciba ip y lo limpiamos.
+    # Más seguro: hacemos un wrapper sobre el setter del campo ip.
+    # Inyectamos una transformación al final del archivo.
+    cat >> models/Event.js <<'PATCH'
+
+// ---- Q10 IP port-strip patch ----
+(function() {
+  const _Event = module.exports.default || module.exports;
+  if (_Event && _Event.prototype) {
+    const _origSetIp = Object.getOwnPropertyDescriptor(_Event.prototype, "ip");
+    Object.defineProperty(_Event.prototype, "ip", {
+      get() { return this.getDataValue ? this.getDataValue("ip") : undefined; },
+      set(v) {
+        const clean = (v && typeof v === "string") ? v.replace(/:[0-9]+$/, "") : v;
+        if (this.setDataValue) this.setDataValue("ip", clean);
+      },
+      configurable: true,
+      enumerable: true
+    });
+  }
+})();
+PATCH
+    \
+    # ---- Verificación ----
+    echo "=== User.js ==="; \
+    grep -n "lastActiveIp\|lastSignedInIp" models/User.js | head -10; \
+    echo "=== context.js ==="; \
+    grep -n "lastActiveIp\|ip:" context.js | head -10; \
+    echo "=== Event.js (últimas 25 líneas) ==="; \
+    tail -25 models/Event.js; \
     echo "=== Patches aplicados ==="
 
 USER nodejs
