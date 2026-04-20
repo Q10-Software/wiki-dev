@@ -1,24 +1,25 @@
-# Extiende la imagen oficial de Outline con un patch mínimo
-# para que funcione detrás de Azure App Service (X-Forwarded-For con puerto).
-#
-# Issue upstream: https://github.com/outline/outline/issues/6083
-
 ARG OUTLINE_VERSION=latest
 FROM docker.getoutline.com/outlinewiki/outline:${OUTLINE_VERSION}
 
 USER root
 
-# Patch: Outline recibe "IP:PUERTO" en ctx.ip porque Azure App Service
-# inyecta el puerto TCP en X-Forwarded-For. Strip del puerto antes de
-# persistirlo en lastActiveIp / lastSignedInIp.
+# Patch: Outline recibe "IP:PUERTO" en ctx.request.ip / ctx.ip porque Azure
+# App Service inyecta el puerto TCP en X-Forwarded-For. Strip del puerto
+# antes de persistirlo en lastActiveIp / lastSignedInIp.
+#
+# Issue upstream: https://github.com/outline/outline/issues/6083
+
 RUN set -eux; \
     cd /opt/outline/build/server; \
-    # Reemplaza todas las referencias a ctx.ip en los archivos relevantes
-    for f in utils/authentication.js middlewares/passport.js commands/userProvisioner.js commands/accountProvisioner.js; do \
-      if [ -f "$f" ]; then \
-        sed -i 's/ctx\.ip/(ctx.ip ? ctx.ip.replace(\/:[0-9]\+$\/, "") : ctx.ip)/g' "$f"; \
-        echo "Patched: $f"; \
-      fi; \
-    done
+    # Patch User.js (donde está el flujo principal de signIn → updateSignedIn)
+    sed -i 's|this\.lastActiveIp = ctx\.request\.ip|this.lastActiveIp = (ctx.request.ip \&\& ctx.request.ip.replace(/:[0-9]\+$/, ""))|g' models/User.js; \
+    sed -i 's|this\.lastSignedInIp = ctx\.request\.ip|this.lastSignedInIp = (ctx.request.ip \&\& ctx.request.ip.replace(/:[0-9]\+$/, ""))|g' models/User.js; \
+    sed -i 's|_this\.lastActiveIp = ip|_this.lastActiveIp = (ip \&\& typeof ip === "string" ? ip.replace(/:[0-9]\+$/, "") : ip)|g' models/User.js; \
+    # Patch userProvisioner.js (ya parchado antes pero por si acaso)
+    sed -i 's|ctx\.ip|(ctx.ip ? ctx.ip.replace(/:[0-9]\+$/, "") : ctx.ip)|g' commands/userProvisioner.js 2>/dev/null || true; \
+    # Verificación
+    echo "=== Verificando patches en User.js ==="; \
+    grep -n "lastActiveIp\|lastSignedInIp" models/User.js | head -20; \
+    echo "=== Patches aplicados ==="
 
 USER nodejs
